@@ -17,6 +17,7 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use regex::Regex;
 use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use typed_store::{
     Map,
     TypedStoreError,
@@ -92,6 +93,33 @@ impl ShardColumnFamilyNames {
     }
 }
 
+/// Indicates the current status of a shard.
+///
+/// ## State Transitions (Stable Status)
+///
+/// When the node is in stable status (not during recovery), the following transitions are allowed:
+///
+/// ```text
+///     ┌──────┐
+///     │ None │
+///     └──┬─┬─┘
+///        │ │
+///        │ └──────────────┐
+///        ▼                ▼
+///   ┌────────┐    ┌──────────────┐
+///   │ Active │    │ ActiveSync   │
+///   └────┬───┘    └──┬───┬───────┘
+///        │           │   │
+///        │           │   ▼
+///        │           │ ┌──────────────┐
+///        │           │ │ActiveRecover │
+///        │           │ └──────┬───────┘
+///        │           │        │
+///        ▼           ▼        ▼
+///   ┌─────────────────────────┐
+///   │    LockedToMove         │
+///   └─────────────────────────┘
+/// ```
 // Important: this enum is committed to database. Do not modify the existing fields. Only add new
 // fields at the end.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,6 +162,31 @@ impl ShardStatus {
             ShardStatus::ActiveRecover => "ActiveRecover",
             ShardStatus::LockedToMove => "LockedToMove",
         }
+    }
+}
+
+#[derive(Debug)]
+struct ShardStatusState {
+    shard_status: DBMap<(), ShardStatus>,
+}
+
+impl ShardStatusState {
+    pub fn update_status(&mut self, new_status: ShardStatus) -> Result<(), TypedStoreError> {
+        self.shard_status.insert(&(), &new_status)?;
+        Ok(())
+    }
+
+    pub fn get_status(&self) -> Result<Option<ShardStatus>, TypedStoreError> {
+        self.shard_status.get(&())
+    }
+
+    /// Executes a function with mutable access to the shard_status DBMap.
+    /// This allows atomic operations on the shard status within a critical section.
+    pub fn with_shard_status_mut<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut DBMap<(), ShardStatus>) -> R,
+    {
+        f(&mut self.shard_status)
     }
 }
 
@@ -224,7 +277,7 @@ impl From<SecondarySliverData> for SecondarySliver {
 #[derive(Debug, Clone)]
 pub struct ShardStorage {
     id: ShardIndex,
-    shard_status: DBMap<(), ShardStatus>,
+    shard_status: Arc<RwLock<ShardStatusState>>,
     primary_slivers: DBMap<BlobId, PrimarySliverData>,
     secondary_slivers: DBMap<BlobId, SecondarySliverData>,
     shard_sync_progress: DBMap<(), ShardSyncProgress>,
@@ -293,7 +346,8 @@ impl ShardStorage {
         let cf_names = ShardColumnFamilyNames::new(id);
         let rw_options = ReadWriteOptions::default();
 
-        let shard_status = reopen_cf!(
+        // Initialize the shard status column family.
+        let status_cf: DBMap<(), ShardStatus> = reopen_cf!(
             (
                 &cf_names.shard_status,
                 shard_status_column_family_options(db_config),
@@ -301,6 +355,16 @@ impl ShardStorage {
             database,
             rw_options
         );
+
+        // It is ok to directly insert the status during storage opening.
+        if let Some(status) = initial_shard_status {
+            status_cf.insert(&(), &status)?;
+        }
+
+        let shard_status = Arc::new(RwLock::new(ShardStatusState {
+            shard_status: status_cf,
+        }));
+
         let shard_sync_progress = reopen_cf!(
             (
                 &cf_names.shard_sync_progress,
@@ -336,10 +400,6 @@ impl ShardStorage {
             database,
             rw_options
         );
-
-        if let Some(status) = initial_shard_status {
-            shard_status.insert(&(), &status)?;
-        }
 
         Ok(Self {
             id,
@@ -537,9 +597,11 @@ impl ShardStorage {
         )
     }
 
-    pub(crate) fn status(&self) -> Result<ShardStatus, TypedStoreError> {
+    pub(crate) async fn status(&self) -> Result<ShardStatus, TypedStoreError> {
         self.shard_status
-            .get(&())
+            .read()
+            .await
+            .get_status()
             .map(|s| s.unwrap_or(ShardStatus::None))
     }
 
@@ -547,24 +609,79 @@ impl ShardStorage {
     ///
     /// This function will delete the existing sync progress for the shard and reset the shard
     /// sync from scratch.
-    pub(crate) fn record_start_shard_sync(&self) -> Result<(), TypedStoreError> {
-        let mut batch = self.shard_status.batch();
-        batch.delete_batch(&self.shard_sync_progress, [()])?;
-        batch.insert_batch(&self.shard_status, [((), ShardStatus::ActiveSync)])?;
-        batch.write()
+    pub(crate) async fn record_start_shard_sync(&self) -> Result<(), TypedStoreError> {
+        self.shard_status.write().await.with_shard_status_mut(
+            |shard_status| -> Result<(), TypedStoreError> {
+                let mut batch = self.shard_sync_progress.batch();
+                batch.delete_batch(&self.shard_sync_progress, [()])?;
+                batch.insert_batch(shard_status, [((), ShardStatus::ActiveSync)])?;
+                batch.write()?;
+                Ok(())
+            },
+        )?;
+
+        Ok(())
     }
 
-    pub(crate) fn set_active_status(&self) -> Result<(), TypedStoreError> {
-        self.shard_status.insert(&(), &ShardStatus::Active)
+    /// This function is used to force set the shard status to active. Use this function with
+    /// caution.
+    pub(crate) async fn force_set_active_status(&self) -> Result<(), TypedStoreError> {
+        self.shard_status
+            .write()
+            .await
+            .update_status(ShardStatus::Active)?;
+        Ok(())
     }
 
-    pub(crate) fn resume_active_shard_sync(&self) -> Result<ShardLastSyncStatus, TypedStoreError> {
-        // Note that when active shard sync is stopped in the middle and shard recover starts,
-        // the shard sync progress recorded in the db is not deleted, until the shard is completely
-        // synced. By setting the shard status to active sync, the shard will resume the sync from
-        // the last synced blob id.
-        self.shard_status.insert(&(), &ShardStatus::ActiveSync)?;
-        self.get_last_sync_status(&ShardStatus::ActiveSync)
+    /// This function is used when restarting the shard sync task after a node restart.
+    /// Particularly, if `restart_shard_sync_always_retry_transfer_first` is true, the task will
+    /// retry using active shard sync instead of shard recovery.
+    /// Return the current shard status after shard status is updated.
+    pub(crate) async fn shard_status_resume_active_shard_sync(
+        &self,
+        restart_shard_sync_always_retry_transfer_first: bool,
+    ) -> Result<ShardStatus, TypedStoreError> {
+        let shard_status = if restart_shard_sync_always_retry_transfer_first {
+            self.shard_status.write().await.with_shard_status_mut(
+                |shard_status| -> Result<ShardStatus, TypedStoreError> {
+                    let existing_status = shard_status.get(&())?;
+                    if existing_status == Some(ShardStatus::ActiveRecover) {
+                        // Note that when active shard sync is stopped in the middle and shard
+                        // recover starts, the shard sync progress recorded in the db is not
+                        // deleted, until the shard is completely synced. By setting the shard
+                        // status to active sync, the shard will resume the sync from the last
+                        // synced blob id.
+                        // We can only resume to active sync from active recover.
+                        tracing::info!(
+                            walrus.shard_index = %self.id(),
+                            "resuming shard sync from active recover to active sync"
+                        );
+                        shard_status.insert(&(), &ShardStatus::ActiveSync)?;
+                        Ok(ShardStatus::ActiveSync)
+                    } else {
+                        Ok(existing_status.unwrap_or(ShardStatus::None))
+                    }
+                },
+            )?
+        } else {
+            self.status().await?
+        };
+
+        if shard_status == ShardStatus::ActiveSync {
+            let shard_last_sync_status = self.get_last_sync_status(&ShardStatus::ActiveSync)?;
+            tracing::info!(
+                walrus.shard_index = %self.id(),
+                ?shard_last_sync_status,
+                "resuming shard sync from the last synced blob id"
+            );
+        } else if shard_status == ShardStatus::ActiveRecover {
+            tracing::info!(
+                walrus.shard_index = %self.id(),
+                "resuming shard recover"
+            );
+        }
+
+        Ok(shard_status)
     }
 
     /// Fetches the slivers with `sliver_type` for the provided blob IDs.
@@ -682,12 +799,8 @@ impl ShardStorage {
                 sui_macros::fail_point!("fail_point_direct_shard_sync_recovery");
             }
         }
+        let shard_status = self.status().await?;
 
-        if self.status()? == ShardStatus::None {
-            self.shard_status.insert(&(), &ShardStatus::ActiveSync)?
-        }
-
-        let shard_status = self.status()?;
         // (WAL-903): determine the correct behavior for shard status LockedToMove. This status
         // indicates that the previous shard sync hasn't finished yet, but the shard is moving
         // out. We continue to sync the shard in this case.
@@ -740,10 +853,23 @@ impl ShardStorage {
         self.recovery_any_missing_slivers(node, config, epoch)
             .await?;
 
-        let mut batch = self.shard_status.batch();
-        batch.insert_batch(&self.shard_status, [((), ShardStatus::Active)])?;
-        batch.delete_batch(&self.shard_sync_progress, [()])?;
-        batch.write()?;
+        self.shard_status.write().await.with_shard_status_mut(
+            |shard_status| -> Result<(), TypedStoreError> {
+                let mut batch = self.shard_sync_progress.batch();
+                let current_status = shard_status.get(&())?;
+                // If the shard is in active sync or active recover, we need to update the status to
+                // active. Otherwise, the shard status is interrupted by another process and are in
+                // unexpected state and we should not update the status.
+                if current_status == Some(ShardStatus::ActiveSync)
+                    || current_status == Some(ShardStatus::ActiveRecover)
+                {
+                    batch.insert_batch(shard_status, [((), ShardStatus::Active)])?;
+                }
+                batch.delete_batch(&self.shard_sync_progress, [()])?;
+                batch.write()?;
+                Ok(())
+            },
+        )?;
 
         Ok(())
     }
@@ -1020,7 +1146,19 @@ impl ShardStorage {
         sui_macros::fail_point!("fail_point_shard_sync_recovery");
 
         tracing::info!("shard sync is done; still has missing blobs; shard enters recovery mode");
-        self.shard_status.insert(&(), &ShardStatus::ActiveRecover)?;
+        self.shard_status.write().await.with_shard_status_mut(
+            |shard_status| -> Result<(), TypedStoreError> {
+                let existing_status = shard_status.get(&())?;
+                if existing_status == Some(ShardStatus::ActiveSync) {
+                    shard_status.insert(&(), &ShardStatus::ActiveRecover)?;
+                }
+                // TODO(WAL-903): currently, we do not stop the shard recover if the shard is no
+                // longer in ActiveSync status. From the shard sync responsibility perspective,
+                // this shard is responsible for all the blobs in the shard to be transferred to
+                // the new node. However, this may not be the most desired behavior.
+                Ok(())
+            },
+        )?;
 
         #[cfg(msim)]
         {
@@ -1305,8 +1443,12 @@ impl ShardStorage {
     }
 
     /// Locks the shard for moving to another node.
-    pub(crate) fn lock_shard_for_epoch_change(&self) -> Result<(), TypedStoreError> {
-        self.shard_status.insert(&(), &ShardStatus::LockedToMove)
+    pub(crate) async fn lock_shard_for_epoch_change(&self) -> Result<(), TypedStoreError> {
+        // We should always be able to lock the shard for epoch change.
+        self.shard_status
+            .write()
+            .await
+            .update_status(ShardStatus::LockedToMove)
     }
 
     #[cfg(test)]
@@ -1324,8 +1466,11 @@ impl ShardStorage {
     }
 
     #[cfg(test)]
-    pub(crate) fn update_status_in_test(&self, status: ShardStatus) -> Result<(), TypedStoreError> {
-        self.shard_status.insert(&(), &status)
+    pub(crate) async fn update_status_in_test(
+        &self,
+        status: ShardStatus,
+    ) -> Result<(), TypedStoreError> {
+        self.shard_status.write().await.update_status(status)
     }
 
     #[cfg(test)]
