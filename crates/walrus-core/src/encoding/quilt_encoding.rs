@@ -489,10 +489,6 @@ impl QuiltEnum {
         quilt_blob: Vec<u8>,
         encoding_config: &EncodingConfigEnum<'_>,
     ) -> Result<QuiltEnum, QuiltError> {
-        if quilt_blob.is_empty() {
-            return Err(QuiltError::EmptyInput("quilt_blob".to_string()));
-        }
-        
         let quilt_version = QuiltVersionEnum::new_from_sliver(&quilt_blob)?;
         match quilt_version {
             QuiltVersionEnum::V1 => {
@@ -939,6 +935,10 @@ impl QuiltApi<QuiltVersionV1> for QuiltV1 {
         quilt_blob: Vec<u8>,
         encoding_config: &EncodingConfigEnum<'_>,
     ) -> Result<QuiltV1, QuiltError> {
+        if quilt_blob.is_empty() {
+            return Err(QuiltError::EmptyInput("quilt_blob".to_string()));
+        }
+
         let n_primary_source_symbols =
             usize::from(encoding_config.n_source_symbols::<Primary>().get());
         let n_secondary_source_symbols =
@@ -1097,10 +1097,6 @@ impl QuiltV1 {
                 .expect("quilt index should be set"));
         }
         
-        if self.symbol_size == 0 || self.row_size == 0 || self.data.is_empty() {
-            return Err(QuiltError::Other("empty quilt data".to_string()));
-        }
-
         let columns_size = self.data.len() / self.row_size * self.symbol_size;
         let quilt_index = QuiltVersionV1::decode_quilt_index(self, columns_size)?;
         self.quilt_index = Some(quilt_index);
