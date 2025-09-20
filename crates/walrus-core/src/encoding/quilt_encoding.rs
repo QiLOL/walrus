@@ -489,6 +489,10 @@ impl QuiltEnum {
         quilt_blob: Vec<u8>,
         encoding_config: &EncodingConfigEnum<'_>,
     ) -> Result<QuiltEnum, QuiltError> {
+        if quilt_blob.is_empty() {
+            return Err(QuiltError::EmptyInput("quilt_blob".to_string()));
+        }
+        
         let quilt_version = QuiltVersionEnum::new_from_sliver(&quilt_blob)?;
         match quilt_version {
             QuiltVersionEnum::V1 => {
@@ -935,10 +939,6 @@ impl QuiltApi<QuiltVersionV1> for QuiltV1 {
         quilt_blob: Vec<u8>,
         encoding_config: &EncodingConfigEnum<'_>,
     ) -> Result<QuiltV1, QuiltError> {
-        if quilt_blob.is_empty() {
-            return Err(QuiltError::EmptyInput("quilt_blob".to_string()));
-        }
-
         let n_primary_source_symbols =
             usize::from(encoding_config.n_source_symbols::<Primary>().get());
         let n_secondary_source_symbols =
