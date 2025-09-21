@@ -1096,7 +1096,7 @@ impl QuiltV1 {
                 .as_ref()
                 .expect("quilt index should be set"));
         }
-        
+
         let columns_size = self.data.len() / self.row_size * self.symbol_size;
         let quilt_index = QuiltVersionV1::decode_quilt_index(self, columns_size)?;
         self.quilt_index = Some(quilt_index);
@@ -2495,9 +2495,6 @@ mod tests {
     fn test_new_from_quilt_blob_panics_on_empty_input() {
         use core::num::NonZeroU16;
         let config = ReedSolomonEncodingConfig::new(NonZeroU16::new(7).unwrap());
-        let _ = QuiltV1::new_from_quilt_blob(
-            Vec::new(),
-            &EncodingConfigEnum::ReedSolomon(&config),
-        );
+        let _ = QuiltV1::new_from_quilt_blob(Vec::new(), &EncodingConfigEnum::ReedSolomon(&config));
     }
 }
