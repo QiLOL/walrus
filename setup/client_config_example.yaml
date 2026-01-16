@@ -1,5 +1,7 @@
 system_object: 0xa2637d13d171b278eadfa8a3fbe8379b5e471e1f3739092e5243da17fc8090eb
 staking_object: 0xca7cf321e47a1fc9bfd032abc31b253f5063521fd5b4c431f2cdd3fee1b4ec00
+n_shards: 1000
+max_epochs_ahead: 53
 cache_ttl_secs: 10
 exchange_objects:
 - 0xa9b00f69d3b033e7b64acff2672b54fbb7c31361954251e235395dea8bd6dcac
@@ -14,7 +16,7 @@ communication_config:
   max_concurrent_status_reads: null
   max_data_in_flight: 12500000
   reqwest_config:
-    total_timeout_millis: 30000
+    total_timeout_millis: 300000
     pool_idle_timeout_millis: null
     http2_keep_alive_timeout_millis: 5000
     http2_keep_alive_interval_millis: 30000
@@ -30,6 +32,21 @@ communication_config:
   sliver_write_extra_time:
     factor: 0.5
     base_millis: 500
+  sliver_status_check_threshold: 5560
+  tail_handling: blocking
+  data_in_flight_auto_tune:
+    enabled: false
+    window_sample_target: 20
+    window_timeout_millis: 10000
+    increase_factor: 2.0
+    lock_factor: 1.5
+    min_permits: 50
+    max_permits: 2000
+    secondary_weight: 0.5
+    min_blob_size_bytes: 52428800
+  upload_mode: balanced
+  pending_uploads_enabled: false
+  optimistic_upload_max_blob_bytes: 4194304
   registration_delay_millis: 200
   max_total_blob_size: 1073741824
   committee_change_backoff:
@@ -46,3 +63,10 @@ refresh_config:
 quilt_client_config:
   max_retrieve_slivers_attempts: 2
   timeout_secs: 10
+byte_range_read_client_config:
+  max_retrieve_slivers_attempts: 2
+  timeout_secs: 10
+streaming_config:
+  max_sliver_retry_attempts: 5
+  sliver_timeout_secs: 30
+  prefetch_count: 4
